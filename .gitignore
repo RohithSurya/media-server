@@ -1,0 +1,17 @@
+# Secrets
+.env
+
+# Service runtime state / config (not code)
+bazarr/
+data/
+jellyfin/
+prowlarr/
+radarr/
+sonarr/
+
+# Compose backups
+docker-compose.yaml.bak.*
+
+# Python
+__pycache__/
+*.pyc

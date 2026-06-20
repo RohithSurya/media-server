@@ -1,0 +1,154 @@
+---
+services:
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - VPN_SERVICE_PROVIDER=protonvpn
+      - VPN_TYPE=wireguard
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      - SERVER_COUNTRIES=Netherlands            # adjust to preferred country
+      - FREE_ONLY=on                             # free Proton plan -> only free servers
+      # Port forwarding is NOT available on the free plan; leave it off.
+      # Allow LAN (10.0.0.0/24) and Tailscale (100.64.0.0/10) past the kill switch
+      # so the web UIs stay reachable when the tunnel is up.
+      - FIREWALL_OUTBOUND_SUBNETS=10.0.0.0/24,100.64.0.0/10
+      - TZ=Etc/UTC
+    ports:
+      - 9696:9696                                # prowlarr UI (moved here from prowlarr)
+      - 8000:8000                                # gluetun control/health API
+      - 8191:8191                                # flaresolverr (moved here from flaresolverr)
+      - 8989:8989                                # sonarr (moved here from sonarr)
+      - 7878:7878                                # radarr (moved here from radarr)
+    restart: unless-stopped
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    network_mode: "service:gluetun"              # all prowlarr traffic exits via the VPN
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    volumes:
+      - ./prowlarr/config:/config                # prowlarr config persisted in-project
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    restart: unless-stopped
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    network_mode: "service:gluetun"              # MUST share prowlarr's VPN exit IP
+    environment:                                 # (cf_clearance cookies are IP-bound)
+      - LOG_LEVEL=info
+      - TZ=Etc/UTC
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    restart: unless-stopped
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    network_mode: "service:gluetun"              # behind VPN: shares FlareSolverr exit IP
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+    volumes:
+      - ./sonarr/config:/config
+      - ./data:/data                             # single root -> hardlink imports
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    restart: unless-stopped
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    network_mode: "service:gluetun"              # behind VPN: shares FlareSolverr exit IP
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+    volumes:
+      - ./radarr/config:/config
+      - ./data:/data
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    restart: unless-stopped
+
+  seedr-bridge:
+    build: ./seedr-bridge
+    container_name: seedr-bridge
+    user: "1000:1000"                            # write files as the *arr user for clean imports
+    environment:                                 # NOT behind VPN (cloud download only)
+      - SEEDR_EMAIL=${SEEDR_EMAIL}
+      - SEEDR_PASSWORD_B64=${SEEDR_PASSWORD_B64}  # base64; '$' in pw breaks plain interpolation
+      - TZ=America/New_York
+      - POLL_INTERVAL=30
+      # stalled-download auto-retry + notify (gluetun shares the *arr netns)
+      - RADARR_URL=http://gluetun:7878
+      - RADARR_API_KEY=${RADARR_API_KEY}
+      - SONARR_URL=http://gluetun:8989
+      - SONARR_API_KEY=${SONARR_API_KEY}
+      - NTFY_SERVER=https://ntfy.sh
+      - NTFY_TOPIC=${NTFY_TOPIC}
+      - STALL_TIMEOUT=2700                          # 45 min, in seconds
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    network_mode: host                           # reaches sonarr/radarr on 127.0.0.1:8989/7878
+    environment:                                 # (their ports are published on the host by gluetun)
+      - PUID=1000                                # NOT behind VPN: subtitle providers don't need it
+      - PGID=1000
+      - TZ=America/New_York
+    volumes:
+      - ./bazarr/config:/config
+      - ./data:/data                             # same root as sonarr/radarr -> 1:1 path mapping
+    restart: unless-stopped
+
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    network_mode: host                           # LAN/DLNA discovery + reachable on Tailscale IP
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+    volumes:
+      - ./jellyfin/config:/config
+      - ./data/media:/data/media:ro
+    restart: unless-stopped
+
+  jellyfin-reaper:
+    build: ./jellyfin-reaper
+    container_name: jellyfin-reaper
+    user: "1000:1000"
+    environment:                                 # deletes a movie once ALL Jellyfin users
+      - TZ=America/New_York                       # have watched it + GRACE_DAYS elapsed
+      - JELLYFIN_URL=http://host.docker.internal:8096   # jellyfin is host-net -> via host gateway
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY}      # mint in Jellyfin UI: Dashboard -> API Keys
+      - RADARR_URL=http://gluetun:7878            # delete via Radarr API (deleteFiles=true)
+      - RADARR_API_KEY=${RADARR_API_KEY}
+      - NTFY_SERVER=https://ntfy.sh
+      - NTFY_TOPIC=${NTFY_TOPIC}
+      - GRACE_DAYS=15                             # days after last watch before deleting
+      - CHECK_INTERVAL=21600                       # 6 h between runs
+      - MAX_DELETES_PER_RUN=5                       # blast-radius cap
+      - DRY_RUN=true                               # FLIP to false after verifying the dry-run list
+      # - JELLYFIN_USERS=                          # optional: restrict quorum to these user names
+    extra_hosts:
+      - "host.docker.internal:host-gateway"       # reach host-network Jellyfin (8096)
+    restart: unless-stopped

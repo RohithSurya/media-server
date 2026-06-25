@@ -8,6 +8,7 @@ jellyfin/
 prowlarr/
 radarr/
 sonarr/
+media-bridge/config/
 
 # Compose backups
 docker-compose.yaml.bak.*

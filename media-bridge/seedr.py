@@ -28,12 +28,14 @@ import time
 import pathlib
 import requests
 
+from common import clog, norm, ntfy
+
 FAIL_COUNTS = {}  # magnet filename -> consecutive 413 attempts (in-memory)
 TOMBSTONE_GRACE = 600  # secs to keep reaping a superseded release's late-appearing Seedr folder
 
 
-def norm(s):
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+def log(msg):
+    clog("seedr", msg)
 
 
 def movie_key(release_name):
@@ -61,18 +63,13 @@ CATEGORIES = ["sonarr", "radarr"]
 # Stalled-download handling: if a transfer's progress hasn't advanced for this long,
 # fail it in Radarr/Sonarr (-> blocklist + auto re-grab a different release) and notify.
 STALL_TIMEOUT = int(os.environ.get("STALL_TIMEOUT", "2700"))   # 45 min
-NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
+FETCH_SKIP_MAX = int(os.environ.get("FETCH_SKIP_MAX", str(1 << 20)))  # <1 MB: skip an unfetchable junk sidecar instead of failing the whole folder
 ARR = {"radarr": (os.environ.get("RADARR_URL"), os.environ.get("RADARR_API_KEY")),
        "sonarr": (os.environ.get("SONARR_URL"), os.environ.get("SONARR_API_KEY"))}
 
 SESSION = requests.Session()
 SESSION.auth = (EMAIL, PASSWORD)
 SESSION.headers["User-Agent"] = "seedr-bridge/1.0"
-
-
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def api(method, path, **kw):
@@ -113,7 +110,19 @@ def fetch_folder_recursive(folder_id, dest_root: pathlib.Path):
         size = f.get("size")
         if dest.exists() and size and dest.stat().st_size == size:
             continue
-        download_file(f["id"], dest)
+        try:
+            download_file(f["id"], dest)
+        except Exception as e:
+            # Junk sidecars (YTSProxies.com.txt, "Torrent Downloaded From*.txt",
+            # RARBG.nfo, ...) sometimes 404 on Seedr's CDN. They're not media and
+            # the *arr import ignores them, so a small file we can't fetch must
+            # NOT poison the whole folder (which would block delete_folder + the
+            # import forever and re-thrash the big mkv). Skip it; re-raise on any
+            # substantial file so real media still benefits from retry/resume.
+            if size and size < FETCH_SKIP_MAX:
+                log(f"    skipping unfetchable sidecar {f['name']} ({size:,} B): {e}")
+                continue
+            raise
     for sub in listing.get("folders", []):
         fetch_folder_recursive(sub["id"], dest_root / sub["path"])
 
@@ -203,13 +212,7 @@ def purge_superseded(cat, new_key, new_name, root):
 
 
 def notify(title, body):
-    if not NTFY_TOPIC:
-        return
-    try:
-        requests.post(f"{NTFY_SERVER}/{NTFY_TOPIC}", data=body.encode(),
-                      headers={"Title": title, "Priority": "high", "Tags": "warning"}, timeout=15)
-    except Exception as e:
-        log(f"    (warn) ntfy notify failed: {e}")
+    ntfy(title, body, priority="high", tags="warning")
 
 
 def arr_mark_failed(cat, release_name):
@@ -408,7 +411,7 @@ def check_completions():
         log(f"[{cat}] '{title}' finished but result not visible yet; will retry")
 
 
-def main():
+def run_forever():
     log(f"seedr-bridge starting; polling every {POLL}s")
     try:
         root = list_folder()
@@ -427,4 +430,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_forever()

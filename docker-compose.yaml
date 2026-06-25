@@ -7,16 +7,21 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
     environment:
       - VPN_SERVICE_PROVIDER=protonvpn
       - VPN_TYPE=wireguard
       - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
-      - SERVER_COUNTRIES=Netherlands            # adjust to preferred country
+      - SERVER_COUNTRIES=Switzerland            # adjust to preferred country
       - FREE_ONLY=on                             # free Proton plan -> only free servers
       # Port forwarding is NOT available on the free plan; leave it off.
       # Allow LAN (10.0.0.0/24) and Tailscale (100.64.0.0/10) past the kill switch
       # so the web UIs stay reachable when the tunnel is up.
       - FIREWALL_OUTBOUND_SUBNETS=10.0.0.0/24,100.64.0.0/10
+      - DNS_ADDRESS=9.9.9.9
+      - DNS_UPSTREAM_RESOLVERS=quad9,google
       - TZ=Etc/UTC
     ports:
       - 9696:9696                                # prowlarr UI (moved here from prowlarr)
@@ -24,6 +29,8 @@ services:
       - 8191:8191                                # flaresolverr (moved here from flaresolverr)
       - 8989:8989                                # sonarr (moved here from sonarr)
       - 7878:7878                                # radarr (moved here from radarr)
+      - 8001:8001                                # mediafusion-api (torznab feed)
+      - 127.0.0.1:5432:5432                      # mediafusion-postgres (local DB tools only)
     restart: unless-stopped
 
   prowlarr:
@@ -85,25 +92,56 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  seedr-bridge:
-    build: ./seedr-bridge
-    container_name: seedr-bridge
+  # ── media-bridge: three custom services in one container ──────────────────────
+  # seedr blackhole bridge + jellyfin-reaper + movierulz scraper/Torznab feed.
+  # NOT behind the VPN (default bridge net) -> seedr's CDN downloads stay direct/fast.
+  # Reaches *arr + FlareSolverr via the gluetun hostname (their ports are published on
+  # gluetun); the movierulz crawler fetches the (CF-protected) site THROUGH FlareSolverr,
+  # so this container itself never needs the VPN namespace. The Torznab feed is published
+  # on the host (8002), so it is unaffected by the gluetun restart gotcha.
+  media-bridge:
+    build: ./media-bridge
+    container_name: media-bridge
     user: "1000:1000"                            # write files as the *arr user for clean imports
-    environment:                                 # NOT behind VPN (cloud download only)
+    ports:
+      - 8002:8002                                # movierulz Torznab feed (host-published)
+    environment:
+      - TZ=America/New_York
+      # --- seedr blackhole bridge ---
       - SEEDR_EMAIL=${SEEDR_EMAIL}
       - SEEDR_PASSWORD_B64=${SEEDR_PASSWORD_B64}  # base64; '$' in pw breaks plain interpolation
-      - TZ=America/New_York
       - POLL_INTERVAL=30
-      # stalled-download auto-retry + notify (gluetun shares the *arr netns)
+      - STALL_TIMEOUT=2700                          # 45 min, in seconds
+      # --- shared *arr / jellyfin / ntfy ---
       - RADARR_URL=http://gluetun:7878
       - RADARR_API_KEY=${RADARR_API_KEY}
       - SONARR_URL=http://gluetun:8989
       - SONARR_API_KEY=${SONARR_API_KEY}
+      - JELLYFIN_URL=http://host.docker.internal:8096   # jellyfin is host-net -> via host gateway
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY}            # mint in Jellyfin UI: Dashboard -> API Keys
       - NTFY_SERVER=https://ntfy.sh
       - NTFY_TOPIC=${NTFY_TOPIC}
-      - STALL_TIMEOUT=2700                          # 45 min, in seconds
+      # --- jellyfin-reaper ---
+      - GRACE_DAYS=15                              # days after last watch before deleting
+      - CHECK_INTERVAL=21600                       # 6 h between runs
+      - MAX_DELETES_PER_RUN=5                      # blast-radius cap
+      - DRY_RUN=false                              # LIVE: reaper actually deletes watched movies
+      # - JELLYFIN_USERS=                          # optional: restrict quorum to these user names
+      # --- movierulz scraper -> Torznab feed ---
+      - MOVIERULZ_BASE=https://www.5movierulz.house
+      - FLARESOLVERR_URL=http://gluetun:8191       # crawl CF-protected site via FlareSolverr
+      - MOVIERULZ_APIKEY=${MOVIERULZ_APIKEY}       # also the Torznab apikey entered in Prowlarr
+      - TORZNAB_PORT=8002
+      - CRAWL_INTERVAL=3600
+      - LANGUAGES=telugu,tamil,malayalam,kannada,bollywood,hollywood
+      - YEARS_BACK=0
+      - FAKE_SEEDERS=50                            # movierulz exposes no seeders; satisfy *arr minimums
+      - REQUEST_DELAY=3
     volumes:
       - ./data:/data
+      - ./media-bridge/config:/config             # sqlite DB of scraped releases
+    extra_hosts:
+      - "host.docker.internal:host-gateway"       # reach host-network Jellyfin (8096)
     restart: unless-stopped
 
   bazarr:
@@ -132,23 +170,81 @@ services:
       - ./data/media:/data/media:ro
     restart: unless-stopped
 
-  jellyfin-reaper:
-    build: ./jellyfin-reaper
-    container_name: jellyfin-reaper
-    user: "1000:1000"
-    environment:                                 # deletes a movie once ALL Jellyfin users
-      - TZ=America/New_York                       # have watched it + GRACE_DAYS elapsed
-      - JELLYFIN_URL=http://host.docker.internal:8096   # jellyfin is host-net -> via host gateway
-      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY}      # mint in Jellyfin UI: Dashboard -> API Keys
-      - RADARR_URL=http://gluetun:7878            # delete via Radarr API (deleteFiles=true)
-      - RADARR_API_KEY=${RADARR_API_KEY}
-      - NTFY_SERVER=https://ntfy.sh
-      - NTFY_TOPIC=${NTFY_TOPIC}
-      - GRACE_DAYS=15                             # days after last watch before deleting
-      - CHECK_INTERVAL=21600                       # 6 h between runs
-      - MAX_DELETES_PER_RUN=5                       # blast-radius cap
-      - DRY_RUN=true                               # FLIP to false after verifying the dry-run list
-      # - JELLYFIN_USERS=                          # optional: restrict quorum to these user names
-    extra_hosts:
-      - "host.docker.internal:host-gateway"       # reach host-network Jellyfin (8096)
+  # ── MediaFusion (Torznab indexer source for Prowlarr) ─────────────────────────
+  # All four share gluetun's network namespace -> reach each other via localhost,
+  # scrape via the VPN, and the API is published on the host through gluetun (8001).
+  mediafusion-postgres:
+    image: postgres:18-alpine
+    container_name: mediafusion-postgres
+    network_mode: "service:gluetun"              # localhost:5432 inside the VPN ns
+    shm_size: 256mb
+    environment:
+      - POSTGRES_USER=mediafusion
+      - POSTGRES_PASSWORD=mediafusion
+      - POSTGRES_DB=mediafusion
+    volumes:
+      - ./mediafusion/postgres:/var/lib/postgresql
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mediafusion -d mediafusion"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mediafusion-redis:
+    image: redis:latest
+    container_name: mediafusion-redis
+    network_mode: "service:gluetun"              # localhost:6379 inside the VPN ns
+    command: redis-server --appendonly yes --save 60 1 --maxmemory-policy allkeys-lru
+    volumes:
+      - ./mediafusion/redis:/data
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mediafusion-api:
+    image: mhdzumair/mediafusion:6.0.0-beta.25
+    container_name: mediafusion-api
+    network_mode: "service:gluetun"              # torznab feed -> gluetun publishes 8001
+    env_file: ./mediafusion.env
+    environment:
+      # This binary is locally built (HEAD > beta.25) and has a migrate.rs
+      # regression; the DB is already migrated by the worker, so skip it here.
+      - MEDIAFUSION_AUTO_MIGRATE=false
+    volumes:
+      # Locally-built mediafusion-api with the Torznab <pubDate> fix (Prowlarr
+      # rejects feed items without pubDate). Remove once a fixed image ships.
+      - ./mediafusion/bin/mediafusion-api:/usr/local/bin/mediafusion-api:ro
+    depends_on:
+      gluetun:
+        condition: service_healthy
+      mediafusion-postgres:
+        condition: service_healthy
+      mediafusion-redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 1m
+      timeout: 10s
+      retries: 5
+      start_period: 20m
+    restart: unless-stopped
+
+  mediafusion-worker:
+    image: mhdzumair/mediafusion:6.0.0-beta.25
+    container_name: mediafusion-worker
+    command: ["/usr/local/bin/mediafusion-worker"]
+    network_mode: "service:gluetun"              # spiders exit via the VPN, like *arr
+    env_file: ./mediafusion.env
+    depends_on:
+      gluetun:
+        condition: service_healthy
+      mediafusion-postgres:
+        condition: service_healthy
+      mediafusion-redis:
+        condition: service_started
     restart: unless-stopped

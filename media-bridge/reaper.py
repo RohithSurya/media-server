@@ -29,6 +29,8 @@ import time
 import datetime
 import requests
 
+from common import clog, ntfy
+
 # ---- config (mirrors seedr-bridge env-loading style) ----
 JELLYFIN_URL = os.environ["JELLYFIN_URL"].rstrip("/")
 JELLYFIN_API_KEY = os.environ["JELLYFIN_API_KEY"]
@@ -42,25 +44,16 @@ DRY_RUN = os.environ.get("DRY_RUN", "true").lower() not in ("false", "0", "no")
 # optional comma-sep list of user NAMES to form the "all users" quorum; default = all enabled users
 USER_FILTER = [u.strip() for u in os.environ.get("JELLYFIN_USERS", "").split(",") if u.strip()]
 
-NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
-
 JF = {"X-Emby-Token": JELLYFIN_API_KEY}
 RA = {"X-Api-Key": RADARR_API_KEY}
 
 
 def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    clog("reaper", msg)
 
 
 def notify(title, body, tags="wastebasket"):
-    if not NTFY_TOPIC:
-        return
-    try:
-        requests.post(f"{NTFY_SERVER}/{NTFY_TOPIC}", data=body.encode(),
-                      headers={"Title": title, "Priority": "default", "Tags": tags}, timeout=15)
-    except Exception as e:
-        log(f"    (warn) ntfy notify failed: {e}")
+    ntfy(title, body, priority="default", tags=tags)
 
 
 def parse_jf_date(s):
@@ -212,7 +205,7 @@ def reap():
         notify(f"{verb} {len(deleted)} watched movie(s)", body)
 
 
-def main():
+def run_forever():
     mode = "DRY-RUN (no deletions)" if DRY_RUN else "LIVE"
     log(f"jellyfin-reaper starting [{mode}]; grace={GRACE_DAYS}d, "
         f"interval={CHECK_INTERVAL}s, max/run={MAX_DELETES_PER_RUN}")
@@ -227,4 +220,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_forever()

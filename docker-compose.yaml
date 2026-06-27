@@ -128,7 +128,7 @@ services:
       - DRY_RUN=false                              # LIVE: reaper actually deletes watched movies
       # - JELLYFIN_USERS=                          # optional: restrict quorum to these user names
       # --- movierulz scraper -> Torznab feed ---
-      - MOVIERULZ_BASE=https://www.5movierulz.house
+      - MOVIERULZ_BASE=${MOVIERULZ_BASE}          # real site URL kept in .env, out of source
       - FLARESOLVERR_URL=http://gluetun:8191       # crawl CF-protected site via FlareSolverr
       - MOVIERULZ_APIKEY=${MOVIERULZ_APIKEY}       # also the Torznab apikey entered in Prowlarr
       - TORZNAB_PORT=8002

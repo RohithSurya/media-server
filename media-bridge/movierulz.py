@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-5movierulz crawler -> Torznab feed for Prowlarr.
+movierulz crawler -> Torznab feed for Prowlarr.
 
 Why this exists: the tamilmv/tamilblasters crawlers are compiled Rust spiders inside
 the MediaFusion image and can't be taught a new site. movierulz is a WordPress-style
@@ -36,7 +36,7 @@ import requests
 from common import clog, norm
 
 # ---- config ----
-BASE = os.environ.get("MOVIERULZ_BASE", "https://www.5movierulz.house").rstrip("/")
+BASE = os.environ.get("MOVIERULZ_BASE", "").rstrip("/")  # required; set in .env (kept out of source)
 FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "http://gluetun:8191").rstrip("/")
 APIKEY = os.environ.get("MOVIERULZ_APIKEY", "")
 PORT = int(os.environ.get("TORZNAB_PORT", "8002"))
@@ -305,6 +305,9 @@ def crawl_once():
 
 def run_crawler():
     db()  # init schema
+    if not BASE:
+        log("MOVIERULZ_BASE is not set -- crawler disabled (set it in .env); Torznab feed still serves")
+        return
     log(f"crawler starting; master /movies crawl every {CRAWL_INTERVAL}s, via {FLARESOLVERR_URL}")
     while True:
         try:
@@ -422,7 +425,7 @@ def results_xml(rows):
         '<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">\n'
         '  <channel>\n'
         '    <title>movierulz</title>\n'
-        '    <description>5movierulz torznab feed</description>\n'
+        '    <description>movierulz torznab feed</description>\n'
         f'    <link>{escape(BASE)}</link>\n'
         + "".join(items) +
         '  </channel>\n'

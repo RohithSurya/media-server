@@ -19,6 +19,7 @@ API contract verified live against the account (Seedr does not publish a schema)
 Auth: HTTP Basic. Password is provided base64-encoded (SEEDR_PASSWORD_B64) to
 survive Docker/shell '$' interpolation; plain SEEDR_PASSWORD also accepted.
 """
+
 import base64
 import json
 import os
@@ -28,12 +29,16 @@ import time
 import pathlib
 import requests
 
+from common import clog, norm, ntfy
+
 FAIL_COUNTS = {}  # magnet filename -> consecutive 413 attempts (in-memory)
-TOMBSTONE_GRACE = 600  # secs to keep reaping a superseded release's late-appearing Seedr folder
+TOMBSTONE_GRACE = (
+    600  # secs to keep reaping a superseded release's late-appearing Seedr folder
+)
 
 
-def norm(s):
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+def log(msg):
+    clog("seedr", msg)
 
 
 def movie_key(release_name):
@@ -43,14 +48,22 @@ def movie_key(release_name):
     Used to recognise that a new release supersedes an old one of the SAME movie."""
     m = re.search(r"\b(19|20)\d{2}\b", release_name)
     if m:
-        return norm(release_name[:m.end()])
-    q = re.search(r"\b(2160p|1080p|720p|480p|bluray|brrip|bdrip|webrip|web|hdtv|x264|x265|hevc)\b",
-                  release_name, re.I)
-    return norm(release_name[:q.start()]) if q else None   # None -> skip supersede (too risky)
+        return norm(release_name[: m.end()])
+    q = re.search(
+        r"\b(2160p|1080p|720p|480p|bluray|brrip|bdrip|webrip|web|hdtv|x264|x265|hevc)\b",
+        release_name,
+        re.I,
+    )
+    return (
+        norm(release_name[: q.start()]) if q else None
+    )  # None -> skip supersede (too risky)
+
 
 EMAIL = os.environ["SEEDR_EMAIL"]
 _pw_b64 = os.environ.get("SEEDR_PASSWORD_B64")
-PASSWORD = base64.b64decode(_pw_b64).decode() if _pw_b64 else os.environ["SEEDR_PASSWORD"]
+PASSWORD = (
+    base64.b64decode(_pw_b64).decode() if _pw_b64 else os.environ["SEEDR_PASSWORD"]
+)
 POLL = int(os.environ.get("POLL_INTERVAL", "30"))
 
 BASE = "https://www.seedr.cc/rest"
@@ -60,19 +73,18 @@ CATEGORIES = ["sonarr", "radarr"]
 
 # Stalled-download handling: if a transfer's progress hasn't advanced for this long,
 # fail it in Radarr/Sonarr (-> blocklist + auto re-grab a different release) and notify.
-STALL_TIMEOUT = int(os.environ.get("STALL_TIMEOUT", "2700"))   # 45 min
-NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
-ARR = {"radarr": (os.environ.get("RADARR_URL"), os.environ.get("RADARR_API_KEY")),
-       "sonarr": (os.environ.get("SONARR_URL"), os.environ.get("SONARR_API_KEY"))}
+STALL_TIMEOUT = int(os.environ.get("STALL_TIMEOUT", "2700"))  # 45 min
+FETCH_SKIP_MAX = int(
+    os.environ.get("FETCH_SKIP_MAX", str(1 << 20))
+)  # <1 MB: skip an unfetchable junk sidecar instead of failing the whole folder
+ARR = {
+    "radarr": (os.environ.get("RADARR_URL"), os.environ.get("RADARR_API_KEY")),
+    "sonarr": (os.environ.get("SONARR_URL"), os.environ.get("SONARR_API_KEY")),
+}
 
 SESSION = requests.Session()
 SESSION.auth = (EMAIL, PASSWORD)
 SESSION.headers["User-Agent"] = "seedr-bridge/1.0"
-
-
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def api(method, path, **kw):
@@ -92,8 +104,9 @@ def add_magnet(magnet):
 def download_file(file_id, dest: pathlib.Path):
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with SESSION.get(f"{BASE}/file/{file_id}", stream=True, timeout=900,
-                     allow_redirects=True) as r:
+    with SESSION.get(
+        f"{BASE}/file/{file_id}", stream=True, timeout=900, allow_redirects=True
+    ) as r:
         r.raise_for_status()
         with open(tmp, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 20):
@@ -113,7 +126,19 @@ def fetch_folder_recursive(folder_id, dest_root: pathlib.Path):
         size = f.get("size")
         if dest.exists() and size and dest.stat().st_size == size:
             continue
-        download_file(f["id"], dest)
+        try:
+            download_file(f["id"], dest)
+        except Exception as e:
+            # Junk sidecars (YTSProxies.com.txt, "Torrent Downloaded From*.txt",
+            # RARBG.nfo, ...) sometimes 404 on Seedr's CDN. They're not media and
+            # the *arr import ignores them, so a small file we can't fetch must
+            # NOT poison the whole folder (which would block delete_folder + the
+            # import forever and re-thrash the big mkv). Skip it; re-raise on any
+            # substantial file so real media still benefits from retry/resume.
+            if size and size < FETCH_SKIP_MAX:
+                log(f"    skipping unfetchable sidecar {f['name']} ({size:,} B): {e}")
+                continue
+            raise
     for sub in listing.get("folders", []):
         fetch_folder_recursive(sub["id"], dest_root / sub["path"])
 
@@ -164,7 +189,9 @@ def cleanup_local_partial(cat, old_title, new_title=None):
     for d in base.iterdir():
         if not d.is_dir():
             continue
-        if new_title and _name_matches(d.name, new_title):   # never the replacement's dir
+        if new_title and _name_matches(
+            d.name, new_title
+        ):  # never the replacement's dir
             continue
         if _name_matches(d.name, old_title):
             shutil.rmtree(d, ignore_errors=True)
@@ -187,29 +214,25 @@ def purge_superseded(cat, new_key, new_name, root):
             continue
         if rec.get("category") != cat or rec.get("superseded"):
             continue
-        if norm(rec.get("title", "")) == norm(new_name):     # same release -> leave it
+        if norm(rec.get("title", "")) == norm(new_name):  # same release -> leave it
             continue
-        if movie_key(rec.get("title", "")) != new_key:        # different movie -> leave it
+        if movie_key(rec.get("title", "")) != new_key:  # different movie -> leave it
             continue
         tid = rec.get("user_torrent_id")
         if tid is not None:
             delete_transfer(tid)
         cleanup_local_partial(cat, rec["title"], new_name)
         rec.update(superseded=True, new_title=new_name, superseded_at=time.time())
-        sp.write_text(json.dumps(rec))                        # tombstone -> reaped by check_completions
+        sp.write_text(json.dumps(rec))  # tombstone -> reaped by check_completions
         n += 1
-        log(f"    [override] superseded '{rec['title']}' (transfer {tid}); deferring folder cleanup")
+        log(
+            f"    [override] superseded '{rec['title']}' (transfer {tid}); deferring folder cleanup"
+        )
     return n
 
 
 def notify(title, body):
-    if not NTFY_TOPIC:
-        return
-    try:
-        requests.post(f"{NTFY_SERVER}/{NTFY_TOPIC}", data=body.encode(),
-                      headers={"Title": title, "Priority": "high", "Tags": "warning"}, timeout=15)
-    except Exception as e:
-        log(f"    (warn) ntfy notify failed: {e}")
+    ntfy(title, body, priority="high", tags="warning")
 
 
 def arr_mark_failed(cat, release_name):
@@ -220,19 +243,33 @@ def arr_mark_failed(cat, release_name):
     if not url or not key:
         return False
     try:
-        h = requests.get(f"{url}/api/v3/history",
-                         params={"eventType": 1, "pageSize": 100,
-                                 "sortKey": "date", "sortDirection": "descending"},
-                         headers={"X-Api-Key": key}, timeout=30)
+        h = requests.get(
+            f"{url}/api/v3/history",
+            params={
+                "eventType": 1,
+                "pageSize": 100,
+                "sortKey": "date",
+                "sortDirection": "descending",
+            },
+            headers={"X-Api-Key": key},
+            timeout=30,
+        )
         h.raise_for_status()
         nrel = norm(release_name)
-        hid = next((r["id"] for r in h.json().get("records", [])
-                    if norm(r.get("sourceTitle", "")) == nrel), None)
+        hid = next(
+            (
+                r["id"]
+                for r in h.json().get("records", [])
+                if norm(r.get("sourceTitle", "")) == nrel
+            ),
+            None,
+        )
         if hid is None:
             log(f"    (warn) no grabbed history match for '{release_name}' in {cat}")
             return False
-        requests.post(f"{url}/api/v3/history/failed/{hid}",
-                      headers={"X-Api-Key": key}, timeout=30).raise_for_status()
+        requests.post(
+            f"{url}/api/v3/history/failed/{hid}", headers={"X-Api-Key": key}, timeout=30
+        ).raise_for_status()
         log(f"    marked {cat} history {hid} failed -> blocklist + auto re-search")
         return True
     except Exception as e:
@@ -243,15 +280,22 @@ def arr_mark_failed(cat, release_name):
 def handle_stalled(cat, rec, sp, prog):
     title = rec["title"]
     release = rec.get("release_name", title)
-    log(f"[{cat}] '{title}' STALLED on Seedr ({prog}% for >{STALL_TIMEOUT // 60}min) -> failing & retrying")
+    log(
+        f"[{cat}] '{title}' STALLED on Seedr ({prog}% for >{STALL_TIMEOUT // 60}min) -> failing & retrying"
+    )
     tid = rec.get("user_torrent_id")
     if tid is not None:
-        delete_transfer(tid)                       # free the dead transfer
+        delete_transfer(tid)  # free the dead transfer
     retried = arr_mark_failed(cat, release)
-    notify(f"Stalled: {release}",
-           f"Stuck at {prog}% for {STALL_TIMEOUT // 60} min on Seedr. "
-           + ("Asked Radarr/Sonarr to grab a different release."
-              if retried else "Could not reach Radarr/Sonarr -- override it manually."))
+    notify(
+        f"Stalled: {release}",
+        f"Stuck at {prog}% for {STALL_TIMEOUT // 60} min on Seedr. "
+        + (
+            "Asked Radarr/Sonarr to grab a different release."
+            if retried
+            else "Could not reach Radarr/Sonarr -- override it manually."
+        ),
+    )
     # tombstone -> existing reaper cleans any partial folder/local dir and we stop re-failing
     rec.update(superseded=True, new_title=None, superseded_at=time.time(), stalled=True)
     sp.write_text(json.dumps(rec))
@@ -279,7 +323,10 @@ def process_new_magnets():
             try:
                 resp = add_magnet(magnet)
             except requests.HTTPError as e:
-                if getattr(e, "response", None) is not None and e.response.status_code == 413:
+                if (
+                    getattr(e, "response", None) is not None
+                    and e.response.status_code == 413
+                ):
                     try:
                         r = list_folder()
                         free = r.get("space_max", 0) - r.get("space_used", 0)
@@ -289,18 +336,24 @@ def process_new_magnets():
                     # retry the add next loop instead of dropping this one as too large.
                     if nkey and purge_superseded(cat, nkey, mfile.stem, r) > 0:
                         FAIL_COUNTS.pop(mfile.name, None)
-                        log(f"    [override] freed Seedr space from old release; will retry add for {mfile.name}")
+                        log(
+                            f"    [override] freed Seedr space from old release; will retry add for {mfile.name}"
+                        )
                         continue
                     n = FAIL_COUNTS.get(mfile.name, 0) + 1
                     FAIL_COUNTS[mfile.name] = n
                     # plenty of free space yet still 413 => the torrent itself is
                     # bigger than the account; it will never fit -> drop it.
                     if free > 20e9 or n >= 5:
-                        log(f"    '{mfile.name}' does not fit Seedr ({free/1e9:.0f}GB free) -> dropping (too large)")
+                        log(
+                            f"    '{mfile.name}' does not fit Seedr ({free / 1e9:.0f}GB free) -> dropping (too large)"
+                        )
                         mfile.unlink()
                         FAIL_COUNTS.pop(mfile.name, None)
                     else:
-                        log(f"    add 413 (Seedr full, {free/1e9:.0f}GB free); attempt {n}/5, will retry")
+                        log(
+                            f"    add 413 (Seedr full, {free / 1e9:.0f}GB free); attempt {n}/5, will retry"
+                        )
                     continue
                 log(f"    add failed ({e}); will retry next loop")
                 continue
@@ -316,9 +369,14 @@ def process_new_magnets():
             # override: drop any old in-progress release of the same movie.
             if nkey:
                 purge_superseded(cat, nkey, mfile.stem, list_folder())
-            rec = {"category": cat, "title": title, "release_name": mfile.stem,
-                   "user_torrent_id": resp.get("user_torrent_id"),
-                   "torrent_hash": resp.get("torrent_hash"), "added": time.time()}
+            rec = {
+                "category": cat,
+                "title": title,
+                "release_name": mfile.stem,
+                "user_torrent_id": resp.get("user_torrent_id"),
+                "torrent_hash": resp.get("torrent_hash"),
+                "added": time.time(),
+            }
             state_file(cat, title).write_text(json.dumps(rec))
             mfile.unlink()
             log(f"    queued on Seedr as '{title}'")
@@ -344,12 +402,16 @@ def check_completions():
         if rec.get("superseded"):
             new_title = rec.get("new_title")
             for name, fid in list(folders.items()):
-                if _name_matches(name, title) and not (new_title and _name_matches(name, new_title)):
+                if _name_matches(name, title) and not (
+                    new_title and _name_matches(name, new_title)
+                ):
                     log(f"    [override] cleaning leftover Seedr folder '{name}'")
                     delete_folder(fid)
             for f in root.get("files", []):
                 nm = f.get("name", "")
-                if _name_matches(nm, title) and not (new_title and _name_matches(nm, new_title)):
+                if _name_matches(nm, title) and not (
+                    new_title and _name_matches(nm, new_title)
+                ):
                     delete_file(f["id"])
             cleanup_local_partial(cat, title, new_title)
             if time.time() - rec.get("superseded_at", 0) > TOMBSTONE_GRACE:
@@ -362,9 +424,13 @@ def check_completions():
             prog, now = round(t.get("progress", 0), 1), time.time()
             log(f"[{cat}] '{title}' downloading on Seedr ({prog}%)")
             if rec.get("last_progress") is None or prog > rec["last_progress"] + 0.05:
-                rec.update(last_progress=prog, last_progress_at=now)   # advanced -> reset stall clock
+                rec.update(
+                    last_progress=prog, last_progress_at=now
+                )  # advanced -> reset stall clock
                 sp.write_text(json.dumps(rec))
-            elif now - rec.get("last_progress_at", rec.get("added", now)) > STALL_TIMEOUT:
+            elif (
+                now - rec.get("last_progress_at", rec.get("added", now)) > STALL_TIMEOUT
+            ):
                 handle_stalled(cat, rec, sp, prog)
             continue  # still in progress -> do NOT fetch yet
         # torrent finished (gone from in-progress) -> locate its result.
@@ -384,6 +450,7 @@ def check_completions():
                 delete_folder(folder_id)
                 sp.unlink()
                 log(f"[{cat}] '{title}' delivered.")
+                log(f"[{cat}] '{title}' downloaded to {dest}")
             except Exception as e:
                 log(f"    fetch failed for '{title}': {e}; will retry")
             continue
@@ -391,7 +458,11 @@ def check_completions():
         match = None
         for f in root.get("files", []):
             stem = norm(os.path.splitext(f.get("name", ""))[0])
-            if stem and (stem[:18] == ntitle[:18] or stem.startswith(ntitle[:16]) or ntitle.startswith(stem[:16])):
+            if stem and (
+                stem[:18] == ntitle[:18]
+                or stem.startswith(ntitle[:16])
+                or ntitle.startswith(stem[:16])
+            ):
                 match = f
                 break
         if match is not None:
@@ -402,13 +473,14 @@ def check_completions():
                 delete_file(match["id"])
                 sp.unlink()
                 log(f"[{cat}] '{title}' delivered.")
+                log(f"[{cat}] '{title}' downloaded to {dest}")
             except Exception as e:
                 log(f"    fetch failed for '{title}': {e}; will retry")
             continue
         log(f"[{cat}] '{title}' finished but result not visible yet; will retry")
 
 
-def main():
+def run_forever():
     log(f"seedr-bridge starting; polling every {POLL}s")
     try:
         root = list_folder()
@@ -427,4 +499,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_forever()

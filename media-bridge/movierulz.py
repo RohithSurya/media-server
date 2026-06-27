@@ -41,21 +41,28 @@ FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "http://gluetun:8191").rst
 APIKEY = os.environ.get("MOVIERULZ_APIKEY", "")
 PORT = int(os.environ.get("TORZNAB_PORT", "8002"))
 CRAWL_INTERVAL = int(os.environ.get("CRAWL_INTERVAL", "3600"))
-# category language slugs; bollywood == Hindi, hollywood == English on this site
-LANGUAGES = [s.strip() for s in os.environ.get(
-    "LANGUAGES", "telugu,tamil,malayalam,kannada,bollywood,hollywood").split(",") if s.strip()]
-YEARS_BACK = int(os.environ.get("YEARS_BACK", "0"))
-MAX_PAGES = int(os.environ.get("MAX_PAGES", "3"))
+# Crawl the master /movies listing page-by-page (newest first) all the way to the last page, so
+# EVERY language and type (incl. *-dubbed) is covered from one source -- nothing is left out.
+# Stop at the first empty page (the true end) or, on incremental re-crawls, once a whole page is
+# posts already seen before this pass (MIN_PAGES floor guards the curated first page from hiding
+# new posts that sit deeper).
+MOVIES_PATH = os.environ.get("MOVIERULZ_MOVIES_PATH", "/movies")
+MIN_PAGES = int(os.environ.get("MIN_PAGES", "3"))     # always scan at least this many pages per pass
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "1000"))  # safety cap; real stop is the last/empty page
 FAKE_SEEDERS = int(os.environ.get("FAKE_SEEDERS", "50"))
 REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "3"))
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "0"))   # 0 = keep forever
 DB_PATH = os.environ.get("MOVIERULZ_DB", "/config/movierulz.db")
 
-LANG_LABEL = {"bollywood": "hindi", "hollywood": "english"}
+# Best-effort language label parsed from the post slug (e.g. '...-telugu-7008.html' or
+# '...-telugu-dubbed-7112.html'). Functionally optional -- the feed matches by title, not language.
+LANG_RE = re.compile(
+    r'-(telugu|tamil|malayalam|kannada|hindi|bengali|punjabi|english)(?:-dubbed)?-\d+\.html$', re.I)
 
-# Map category language slug -> readable label stored in the DB.
-def lang_label(slug):
-    return LANG_LABEL.get(slug, slug)
+
+def lang_from_slug(url):
+    m = LANG_RE.search(url)
+    return m.group(1).lower() if m else "unknown"
 
 
 def log(msg):
@@ -79,7 +86,7 @@ SEASON_WORD = re.compile(r'\bSeason\s*\d+\b', re.I)
 
 QUALITY_RE = re.compile(r'\b(2160p|1080p|720p|480p)\b', re.I)
 YEAR_RE = re.compile(r'\b(19|20)\d{2}\b')
-SITE_PREFIX_RE = re.compile(r'^\s*www\.\S*movierulz\S*\s*-\s*', re.I)
+SITE_PREFIX_RE = re.compile(r'^\s*www\.\S+\s+-\s+', re.I)  # strip leading 'www.<domain> - ' (any spelling)
 EXT_RE = re.compile(r'\.(mkv|mp4|avi)$', re.I)
 SIZE_RE = re.compile(r'(\d+(?:\.\d+)?)\s*(GB|MB)\b', re.I)
 
@@ -116,10 +123,23 @@ def db():
                 added_at REAL
             );
             CREATE INDEX IF NOT EXISTS idx_releases_added ON releases(added_at);
+            CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
             """
         )
         _conn.commit()
     return _conn
+
+
+def get_meta(key):
+    with DB_LOCK:
+        row = db().execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+
+def set_meta(key, value):
+    with DB_LOCK:
+        db().execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)", (key, str(value)))
+        db().commit()
 
 
 def post_seen(post_id):
@@ -234,52 +254,58 @@ def process_post(post_id, url, language):
     return n
 
 
-def category_urls():
-    """Build (url, language_label) pairs for all configured languages."""
-    this_year = datetime.date.today().year
-    pairs = []
-    for slug in LANGUAGES:
-        label = lang_label(slug)
-        pairs.append((f"{BASE}/category/{slug}-featured", label))
-        for y in range(this_year, this_year - YEARS_BACK - 1, -1):
-            pairs.append((f"{BASE}/category/{slug}-movies-{y}", label))
-    return pairs
-
-
 def crawl_once():
+    """Walk /movies/page/1 .. last page (newest first).
+    Until the catalogue has been fully backfilled once (meta 'backfill_done'), keep paginating to the
+    real last page every pass -- this makes the long first backfill RESUMABLE across restarts (already
+    seen posts are skipped cheaply, so re-scanning the early pages is fast). After the backfill has
+    reached the end once, switch to incremental: stop at the first page that is entirely posts known
+    before this pass (MIN_PAGES floor guards the curated first page)."""
     total_posts = total_releases = 0
-    for cat_url, label in category_urls():
-        for page in range(1, MAX_PAGES + 1):
-            url = cat_url if page == 1 else f"{cat_url}/page/{page}"
-            status, html = fetch(url)
-            time.sleep(REQUEST_DELAY)
-            if status != 200 or not html:
-                break
-            ids = []
-            seen_on_page = set()
-            for mobj in POST_RE.finditer(html):
-                pid = int(mobj.group(1))
-                if pid in seen_on_page:
-                    continue
-                seen_on_page.add(pid)
-                ids.append((pid, mobj.group(0)))
-            new = [(pid, u) for pid, u in ids if not post_seen(pid)]
-            for pid, purl in new:
-                total_releases += process_post(pid, purl, label)
+    backfilling = get_meta("backfill_done") != "1"
+    with DB_LOCK:
+        known_before = {r[0] for r in db().execute("SELECT post_id FROM posts").fetchall()}
+    page, reached_end = 1, False
+    while page <= MAX_PAGES:
+        url = f"{BASE}{MOVIES_PATH}/page/{page}"
+        status, html = fetch(url)
+        time.sleep(REQUEST_DELAY)
+        if status != 200 or not html:
+            reached_end = True
+            break
+        page_ids, seen_on_page = [], set()
+        for mobj in POST_RE.finditer(html):
+            pid = int(mobj.group(1))
+            if pid in seen_on_page:
+                continue
+            seen_on_page.add(pid)
+            page_ids.append((pid, mobj.group(0)))
+        if not page_ids:
+            reached_end = True   # past the last real page
+            break
+        for pid, purl in page_ids:
+            if not post_seen(pid):
+                total_releases += process_post(pid, purl, lang_from_slug(purl))
                 total_posts += 1
-            if not new:
-                break   # page fully seen -> stop paginating this category
+        # incremental mode only: once a whole page is posts we already had before this pass, the rest
+        # downstream is older and already indexed -> stop.
+        if not backfilling and page >= MIN_PAGES and all(pid in known_before for pid, _ in page_ids):
+            break
+        page += 1
+    if backfilling and reached_end:
+        set_meta("backfill_done", "1")
+        log("full catalogue backfill complete -> switching to incremental crawls")
     if RETENTION_DAYS > 0:
         cutoff = time.time() - RETENTION_DAYS * 86400
         with DB_LOCK:
             db().execute("DELETE FROM releases WHERE added_at < ?", (cutoff,))
             db().commit()
-    log(f"crawl done: {total_posts} new posts, {total_releases} releases indexed")
+    log(f"crawl done: scanned {page} page(s), {total_posts} new posts, {total_releases} releases indexed")
 
 
 def run_crawler():
     db()  # init schema
-    log(f"crawler starting; {len(LANGUAGES)} languages, every {CRAWL_INTERVAL}s, via {FLARESOLVERR_URL}")
+    log(f"crawler starting; master /movies crawl every {CRAWL_INTERVAL}s, via {FLARESOLVERR_URL}")
     while True:
         try:
             crawl_once()
@@ -344,7 +370,9 @@ def title_matches(q, title):
 def query_releases(t, q, season, cats):
     """Select releases matching the search. Returns list of sqlite rows."""
     with DB_LOCK:
-        rows = db().execute("SELECT * FROM releases ORDER BY added_at DESC LIMIT 2000").fetchall()
+        # scan the whole catalogue (no LIMIT) so old back-catalog stays searchable; the token
+        # matcher below is cheap and results are capped to 100.
+        rows = db().execute("SELECT * FROM releases ORDER BY added_at DESC").fetchall()
     out = []
     for r in rows:
         # kind filter by search type

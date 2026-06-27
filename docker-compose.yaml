@@ -133,8 +133,10 @@ services:
       - MOVIERULZ_APIKEY=${MOVIERULZ_APIKEY}       # also the Torznab apikey entered in Prowlarr
       - TORZNAB_PORT=8002
       - CRAWL_INTERVAL=3600
-      - LANGUAGES=telugu,tamil,malayalam,kannada,bollywood,hollywood
-      - YEARS_BACK=0
+      # crawls the master /movies/page/N listing page 1 -> last page (covers every language + dubbed);
+      # first pass backfills the whole catalogue, later passes stop early at the first all-known page.
+      - MIN_PAGES=3
+      - MAX_PAGES=1000                             # safety cap; real stop is the last/empty page (~407)
       - FAKE_SEEDERS=50                            # movierulz exposes no seeders; satisfy *arr minimums
       - REQUEST_DELAY=3
     volumes:
